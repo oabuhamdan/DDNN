@@ -63,6 +63,7 @@ class ResnetModel(LightningModule):
         if args.precision != "fp32":
             self.automatic_optimization = False
             self.scaler = GradScaler()
+            self.loss = None
 
     def forward(self, x):
         return self.model(x)
@@ -91,21 +92,24 @@ class ResnetModel(LightningModule):
         return loss
 
     def manual_optimization(self, images, labels):
-        optimizer = self.optimizers().optimizer
-        optimizer.zero_grad()
         with autocast(dtype=precisions[args.precision]):
             out = self(images)
             loss = self.loss_function(out, labels)
         loss = self.scaler.scale(loss)
-        self.manual_backward(loss)
-        self.scaler.unscale_(optimizer)
-        self.scaler.step(optimizer)
-        self.scaler.update()
+        self.loss = loss
         return loss, out
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         self.log("throughput", self.throughput.compute().item())
         self.throughput.reset()
+
+        if not self.automatic_optimization:
+            optimizer = self.optimizers().optimizer
+            optimizer.zero_grad()
+            self.manual_backward(self.loss)
+            self.scaler.unscale_(optimizer)
+            self.scaler.step(optimizer)
+            self.scaler.update()
 
     def validation_step(self, batch, batch_idx):
         images, labels = batch
