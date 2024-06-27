@@ -13,7 +13,6 @@ from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.utils.data import DataLoader
 from torchvision import models, datasets, transforms
 from lightning.pytorch.strategies import DeepSpeedStrategy, DDPStrategy, FSDPStrategy
-from deepspeed.ops.adam import DeepSpeedCPUAdam
 import logging
 
 logging.basicConfig(
@@ -22,12 +21,6 @@ logging.basicConfig(
     format="%(message)s",
     level=logging.INFO
 )
-
-models = {
-    "resnet18": models.resnet18,
-    "resnet50": models.resnet50,
-    "resnet152": models.resnet152,
-}
 
 deepspeed_config = dict(process_group_backend="nccl", allgather_bucket_size=5e8, reduce_bucket_size=5e8)
 
@@ -71,12 +64,25 @@ class ProfilerCallback(Callback):
         self.profiler.step()
 
 
-class ResnetModel(LightningModule):
+model_dic = {
+    "resnet152": models.resnet152,
+    "vgg19": models.vgg19_bn,
+}
+
+
+def get_modified_model(name, num_classes):
+    model = model_dic[name](weights=None, num_classes=num_classes)
+    if "resnet" in name:
+        model.conv1 = nn.Conv2d(3, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+    elif "vgg" in name:
+        model.features[0] = nn.Conv2d(3, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+    return model
+
+
+class Model(LightningModule):
     def __init__(self, loss_function, num_classes=10):
         super().__init__()
-        model = models[args.model](weights=None, num_classes=num_classes)
-        model.conv1 = nn.Conv2d(3, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
-        self.model = model
+        self.model = get_modified_model(args.model, num_classes)
         self.train_acc = torchmetrics.classification.Accuracy(task="multiclass", num_classes=num_classes)
         self.valid_acc = torchmetrics.classification.Accuracy(task="multiclass", num_classes=num_classes)
         self.throughput = torchmetrics.SumMetric()
@@ -98,7 +104,7 @@ class ResnetModel(LightningModule):
         throughput = samples_processed // time_elapsed
         self.throughput.update(throughput)
 
-        self.log('train_loss', loss, on_step=True, on_epoch=False, logger=True)
+        self.log('train_loss', loss, on_step=True, on_epoch=False, logger=True, prog_bar=True)
         self.log('train_acc', self.train_acc, on_step=False, on_epoch=True, logger=True, sync_dist=True)
 
         return loss
@@ -117,10 +123,7 @@ class ResnetModel(LightningModule):
         self.log('valid_acc', self.valid_acc, on_step=False, on_epoch=True, logger=True, prog_bar=True, sync_dist=True)
 
     def configure_optimizers(self):
-        if "offload" in args.strategy:
-            optimizer = DeepSpeedCPUAdam(self.parameters(), lr=0.001, weight_decay=1e-4, adamw_mode=True)
-        else:
-            optimizer = torch.optim.AdamW(self.parameters(), weight_decay=1e-4, lr=0.001)
+        optimizer = torch.optim.SGD(self.parameters(), lr=0.01, momentum=0.9, weight_decay=5e-4)
         return optimizer
 
     def train_dataloader(self):
@@ -156,7 +159,7 @@ def main():
         with_stack=True,
     )
 
-    model = ResnetModel(loss_function=nn.CrossEntropyLoss(), num_classes=10)
+    model = Model(loss_function=nn.CrossEntropyLoss(), num_classes=10)
 
     logger = CSVLogger(f"logs/{args.exp_name}/", name="csv_metrics")
 
