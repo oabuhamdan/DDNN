@@ -1,19 +1,17 @@
 import argparse
-import time
 
-import torch
 import torchmetrics
-from lightning import Trainer, Callback
+from lightning import Trainer
 from lightning import seed_everything, LightningModule
 from lightning.pytorch.loggers import CSVLogger
 from lightning.pytorch.plugins import FSDPPrecision, DeepSpeedPrecision, MixedPrecision
+from lightning.pytorch.strategies import DeepSpeedStrategy, DDPStrategy, FSDPStrategy
 from torch import nn
 from torch.cuda.amp import GradScaler
-from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.utils.data import DataLoader
 from torchvision import models, datasets, transforms
-from lightning.pytorch.strategies import DeepSpeedStrategy, DDPStrategy, FSDPStrategy
-import logging
+
+from PyTorchLightning_Callbacks import *
 
 logging.basicConfig(
     filename='report.csv',
@@ -43,28 +41,8 @@ def get_plugins(args):
     return []
 
 
-class ProfilerCallback(Callback):
-    def __init__(self, profiler):
-        self.profiler = profiler
-        self.start_time = None
-
-    def on_train_start(self, trainer, pl_module):
-        self.profiler.start()
-        self.start_time = time.time()
-        print(f"Train_Started: {self.start_time}")
-
-    def on_train_end(self, trainer, pl_module):
-        print(f"Train_Ended: {time.time()}")
-        logging.info(
-            f'{args.model},{args.strategy},{args.batch_size},{args.precision},{args.num_nodes},'
-            f'{time.time() - self.start_time:.2f}')
-        self.profiler.stop()
-
-    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
-        self.profiler.step()
-
-
 model_dic = {
+    "resnet50": models.resnet50,
     "resnet152": models.resnet152,
     "vgg19": models.vgg19_bn,
 }
@@ -85,41 +63,29 @@ class Model(LightningModule):
         self.model = get_modified_model(args.model, num_classes)
         self.train_acc = torchmetrics.classification.Accuracy(task="multiclass", num_classes=num_classes)
         self.valid_acc = torchmetrics.classification.Accuracy(task="multiclass", num_classes=num_classes)
-        self.throughput = torchmetrics.SumMetric()
         self.loss_function = loss_function
 
     def forward(self, x):
         return self.model(x)
 
     def training_step(self, batch, batch_idx):
-        start_time = time.time()
+        with torch.cuda.nvtx.range("Data_Loading"):
+            images, labels = batch
 
-        images, labels = batch
-        out = self(images)
-        loss = self.loss_function(out, labels)
+        with torch.cuda.nvtx.range("Forward"):
+            out = self(images)
+            loss = self.loss_function(out, labels)
 
         self.train_acc(out, labels)
-        samples_processed = images.size(0)
-        time_elapsed = time.time() - start_time
-        throughput = samples_processed // time_elapsed
-        self.throughput.update(throughput)
-
         self.log('train_loss', loss, on_step=True, on_epoch=False, logger=True, prog_bar=True)
-        self.log('train_acc', self.train_acc, on_step=False, on_epoch=True, logger=True, sync_dist=True)
 
         return loss
-
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        self.log("throughput", self.throughput.compute().item())
-        self.throughput.reset()
 
     def validation_step(self, batch, batch_idx):
         images, labels = batch
         out = self(images)
-        loss = self.loss_function(out, labels)
         self.valid_acc(out, labels)
 
-        self.log("val_loss", loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
         self.log('valid_acc', self.valid_acc, on_step=False, on_epoch=True, logger=True, prog_bar=True, sync_dist=True)
 
     def configure_optimizers(self):
@@ -134,7 +100,8 @@ class Model(LightningModule):
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ])
         dataset = datasets.CIFAR10(root="./data", train=True, download=False, transform=transform)
-        train_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+        train_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True,
+                                  pin_memory_device=str(self.device))
         return train_loader
 
     def val_dataloader(self):
@@ -143,21 +110,13 @@ class Model(LightningModule):
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
         dataset = datasets.CIFAR10(root="./data", train=False, download=False, transform=transform)
-        val_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+        val_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, pin_memory=True,
+                                pin_memory_device=str(self.device))
         return val_loader
 
 
 def main():
     seed_everything(42)  # for reproducibility
-
-    prof = torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU],
-        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(f"logs/{args.exp_name}/"),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
-    )
 
     model = Model(loss_function=nn.CrossEntropyLoss(), num_classes=10)
 
@@ -174,7 +133,7 @@ def main():
         enable_model_summary=True,
         detect_anomaly=False,
         enable_checkpointing=False,
-        callbacks=[ProfilerCallback(profiler=prof)],
+        callbacks=[ProfilerCallback(), ThroughputCallback()],
         plugins=get_plugins(args)
     )
 
