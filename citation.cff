@@ -1,0 +1,9 @@
+@software{oabuhamdan_ddnn,
+  author = {Abu Hamdan, Osama and Arslan, Engin},
+  doi = {10.5281/zenodo.1234},
+  month = {12},
+  title = {{My Research Software}},
+  url = {https://github.com/oabuhamdan/DDNN},
+  version = {1.0.0},
+  year = {2024}
+}
